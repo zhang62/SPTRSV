@@ -1,0 +1,1004 @@
+#include "lusol.h"
+#include "cusparse.h"
+
+/*-------------------------------------------*/
+/*     level scheduling kernel               */
+/*-------------------------------------------*/
+__global__
+void L_SOL_LEV(REAL *b, REAL *x, REAL *a, 
+               int *ja, int *ia, int *di,
+               int *jlevL, int l1, int l2) {
+  int i,k,jj;
+
+  // num of half-warps
+  int nhw = gridDim.x*BLOCKDIM/HALFWARP;
+  // half warp id
+  int hwid = (blockIdx.x*BLOCKDIM+threadIdx.x)/HALFWARP;
+  // thread lane in each half warp
+  int lane = threadIdx.x & (HALFWARP-1);
+  // shared memory for patial result
+  volatile __shared__ REAL r[BLOCKDIM+8];
+
+  for (i=l1+hwid; i<l2; i+=nhw) {
+    jj = jlevL[i-1]-1;
+    int p1 = ia[jj];
+    int q1 = di[jj];
+
+    REAL sum = 0.0;
+    for (k=p1+lane; k<q1; k+=HALFWARP)
+      sum += a[k-1]*x[ja[k-1]-1];
+
+    // parallel reduction
+    r[threadIdx.x] = sum;
+    r[threadIdx.x] = sum = sum + r[threadIdx.x+8];
+    r[threadIdx.x] = sum = sum + r[threadIdx.x+4];
+    r[threadIdx.x] = sum = sum + r[threadIdx.x+2];
+    r[threadIdx.x] = sum = sum + r[threadIdx.x+1];
+
+    if (lane == 0) {
+      REAL t = 1.0 / a[q1-1];
+      x[jj] = t*(b[jj] - r[threadIdx.x]);
+    }
+  }
+}
+
+/*----------------- x = U^{-1}*x */
+__global__
+void U_SOL_LEV(REAL *x, REAL *a, 
+               int *ja, int *ia, int *di,
+               int *jlevU, int l1, int l2) {
+  int i,k,jj;
+
+  // num of half-warps
+  int nhw = gridDim.x*BLOCKDIM/HALFWARP;
+  // half warp id
+  int hwid = (blockIdx.x*BLOCKDIM+threadIdx.x)/HALFWARP;
+  // thread lane in each half warp
+  int lane = threadIdx.x & (HALFWARP-1);
+  // shared memory for patial result
+  volatile __shared__ REAL r[BLOCKDIM+8];
+
+  for (i=l1+hwid; i<l2; i+=nhw) {
+    jj = jlevU[i-1]-1;
+    int p1 = di[jj];
+    int q1 = ia[jj+1];
+
+    REAL sum = 0.0;
+    for (k=p1+1+lane; k<q1; k+=HALFWARP)
+      sum += a[k-1]*x[ja[k-1]-1];
+
+    // parallel reduction
+    r[threadIdx.x] = sum;
+    r[threadIdx.x] = sum = sum + r[threadIdx.x+8];
+    r[threadIdx.x] = sum = sum + r[threadIdx.x+4];
+    r[threadIdx.x] = sum = sum + r[threadIdx.x+2];
+    r[threadIdx.x] = sum = sum + r[threadIdx.x+1];
+
+    if (lane == 0) {
+      REAL t = 1.0 / a[p1-1];
+      x[jj] = t*(x[jj] - r[threadIdx.x]);
+    }
+  }
+}
+
+//--------------------------------------------------------
+void luSolvLev(int n, int nnz, struct csr_t *csr,
+               struct level_t *lev, REAL *x, REAL *b)
+{
+  int i, j, *d_ia, *d_ja, *d_di, *d_jlevL, *d_jlevU;
+  REAL *d_a, *d_b, *d_x;
+  double t1, t2;
+
+/*------------------- allocate Device Memory */
+  cudaMalloc((void **)&d_ia, (n+1)*sizeof(int));
+  cudaMalloc((void **)&d_ja, nnz*sizeof(int));
+  cudaMalloc((void **)&d_di, n*sizeof(int));
+  cudaMalloc((void **)&d_a, nnz*sizeof(REAL));
+  cudaMalloc((void **)&d_b, n*sizeof(REAL));
+  cudaMalloc((void **)&d_x, n*sizeof(REAL));
+  cudaMalloc((void **)&d_jlevL, n*sizeof(int));
+  cudaMalloc((void **)&d_jlevU, n*sizeof(int));
+/*------------------- Memcpy */
+  cudaMemcpy(d_ia, csr->ia, (n+1)*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ja, csr->ja, nnz*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_a, csr->a, nnz*sizeof(REAL),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_di, csr->di, n*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_b, b, n*sizeof(REAL),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_jlevL, lev->jlevL, n*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_jlevU, lev->jlevU, n*sizeof(int),
+  cudaMemcpyHostToDevice);
+
+  t1 = wall_timer();
+  for (j=0; j<REPEAT; j++) {
+    // L-solve
+    for (i=0; i<lev->nlevL; i++) {
+      int l1 = lev->ilevL[i];
+      int l2 = lev->ilevL[i+1];
+      int l_size = l2 - l1;
+      int nthreads = min(l_size*HALFWARP, MAXTHREADS);
+      int gDim = (nthreads+BLOCKDIM-1)/BLOCKDIM;
+      int bDim = BLOCKDIM;
+      L_SOL_LEV<<<gDim, bDim>>>(d_b, d_x, d_a, d_ja, d_ia, d_di, d_jlevL, l1, l2);
+    }
+    // U-solve
+    for (i=0; i<lev->nlevU; i++) {
+       int l1 = lev->ilevU[i];
+       int l2 = lev->ilevU[i+1];
+       int l_size = l2 - l1;
+       int nthreads = min(l_size*HALFWARP, MAXTHREADS);
+       int gDim = (nthreads+BLOCKDIM-1)/BLOCKDIM;
+       int bDim = BLOCKDIM;
+       U_SOL_LEV<<<gDim, bDim>>>(d_x, d_a, d_ja, d_ia, d_di, d_jlevU, l1, l2);
+    }
+  }
+
+  //Barrier for GPU calls
+  cudaThreadSynchronize();
+  t2 = wall_timer() - t1;
+
+  printf("[GPU] level-scheduling, #lev in L %d, #lev in U %d\n",
+         lev->nlevL, lev->nlevU);
+  printf("  time(s)=%.2f, Gflops=%.2f", t2, REPEAT*2*(nnz+n)/t2/1e9);
+
+  /*-------- copy x to host mem */
+  cudaMemcpy(x, d_x, n*sizeof(REAL),
+  cudaMemcpyDeviceToHost);
+
+  cudaFree(d_ia);
+  cudaFree(d_ja);
+  cudaFree(d_di);
+  cudaFree(d_a);
+  cudaFree(d_b);
+  cudaFree(d_x);
+  cudaFree(d_jlevL);
+  cudaFree(d_jlevU);
+}
+
+/*----------------------------------------------------------------*/
+void luSolCPU(int n, int nnz, REAL *b, REAL *x, csr_t *csr)
+{
+  int i,k,i1,i2,ii;
+  
+  int *ia = csr->ia;
+  int *ja = csr->ja;
+  REAL *a = csr->a;
+  int *di = csr->di;
+
+  double t1 = wall_timer();
+  
+  for (ii=0; ii<REPEAT; ii++) {
+    /* Forward solve. Solve L*x = b */
+    for (i=0; i<n; i++) {
+      x[i] = b[i];
+      i1 = ia[i];
+      i2 = di[i];
+      for (k=i1; k<i2; k++)
+        x[i] -= a[k-1]*x[ja[k-1]-1];
+      REAL t = 1.0 / a[i2-1];
+      x[i] *= t;
+    }
+    /* Backward slove. Solve x = U^{-1}*x */
+    for (i=n-1; i>=0; i--) {
+      i1 = di[i];
+      i2 = ia[i+1];
+      for (k=i1+1; k<i2; k++)
+        x[i] -= a[k-1]*x[ja[k-1]-1];
+
+      REAL t = 1.0 / a[i1-1];
+      x[i] = t*x[i];
+    }
+  }
+  double t2 = wall_timer() - t1;
+  printf("[CPU]\n");
+  printf("  time(s)=%.2f, Gflops=%.2f\n", t2, 
+          REPEAT*2*(nnz+n)/t2/1e9);
+}
+
+/*-----------------------------------------------*/
+void cuda_init(int argc, char **argv) {
+  int deviceCount, dev;
+  cudaGetDeviceCount(&deviceCount);
+  printf("=========================================\n");
+  if (deviceCount == 0)
+    printf("There is no device supporting CUDA\n");
+
+  for (dev = 0; dev < deviceCount; ++dev) {
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, dev);
+    if (dev == 0) {
+      if (deviceProp.major == 9999 && deviceProp.minor == 9999)
+        printf("There is no device supporting CUDA.\n");
+      else if (deviceCount == 1)
+        printf("There is 1 device supporting CUDA\n");
+      else
+        printf("There are %d devices supporting CUDA\n", deviceCount);
+    }
+    printf("\nDevice %d: \"%s\"\n", dev, deviceProp.name);
+    printf("  Major revision number:          %d\n",
+           deviceProp.major);
+    printf("  Minor revision number:          %d\n",
+           deviceProp.minor);
+    printf("  Total amount of global memory:  %.2f GB\n",
+           deviceProp.totalGlobalMem/1e9);
+  }
+  dev = 0;
+  cudaSetDevice(dev);
+  cudaDeviceProp deviceProp;
+  cudaGetDeviceProperties(&deviceProp, dev);
+  printf("\nRunning on Device %d: \"%s\"\n", dev, deviceProp.name);
+  printf("=========================================\n");
+}
+
+/*---------------------------------------------------*/
+void cuda_check_err() {
+  cudaError_t cudaerr = cudaGetLastError() ;
+  if (cudaerr != cudaSuccess) 
+    printf("error: %s\n",cudaGetErrorString(cudaerr));
+}
+
+void luSolv_cusparse1(struct csr_t *csr, REAL *b, REAL *x) {
+  int n = csr->n;
+  int nnz = csr->nnz; 
+  int *d_ia, *d_ja;
+  REAL *d_a, *d_b, *d_x, *d_y;
+  double t1, t2, ta;
+  REAL done = 1.0;
+/*------------------- allocate Device Memory */
+  cudaMalloc((void **)&d_ia, (n+1)*sizeof(int));
+  cudaMalloc((void **)&d_ja, nnz*sizeof(int));
+  cudaMalloc((void **)&d_a, nnz*sizeof(REAL));
+  cudaMalloc((void **)&d_b, n*sizeof(REAL));
+  cudaMalloc((void **)&d_x, n*sizeof(REAL));
+  cudaMalloc((void **)&d_y, n*sizeof(REAL));
+/*------------------- Memcpy */
+  cudaMemcpy(d_ia, csr->ia, (n+1)*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ja, csr->ja, nnz*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_a, csr->a, nnz*sizeof(REAL),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_b, b, n*sizeof(REAL),
+  cudaMemcpyHostToDevice);
+    
+  cusparseStatus_t status;
+  cusparseHandle_t handle=0;
+  cusparseMatDescr_t descr_L=0, descr_U=0;
+
+  /* initialize cusparse library */
+  status= cusparseCreate(&handle);
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+     printf("CUSPARSE Library initialization failed\n");
+     exit(1);
+  }
+
+  /* create and setup matrix descriptor for L */ 
+  status= cusparseCreateMatDescr(&descr_L); 
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+     printf("Matrix descriptor initialization L failed\n");
+     exit(1);
+  }
+
+  t1 = wall_timer();
+
+  cusparseSolveAnalysisInfo_t info_L = 0;
+  cusparseCreateSolveAnalysisInfo(&info_L);
+  cusparseSetMatType(descr_L,CUSPARSE_MATRIX_TYPE_GENERAL);
+  cusparseSetMatFillMode(descr_L, CUSPARSE_FILL_MODE_LOWER);
+  cusparseSetMatIndexBase(descr_L, CUSPARSE_INDEX_BASE_ONE);
+  cusparseSetMatDiagType(descr_L, CUSPARSE_DIAG_TYPE_NON_UNIT);
+
+#if DOUBLEPRECISION
+  status = cusparseDcsrsv_analysis(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                                   descr_L, d_a, d_ia, d_ja, info_L);
+#else
+  status = cusparseScsrsv_analysis(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                                   descr_L, d_a, d_ia, d_ja, info_L);
+#endif
+
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("cusparse?csrsv_analysis L failed\n");
+    exit(1);
+  }
+
+  /* create and setup matrix descriptor for U */ 
+  status= cusparseCreateMatDescr(&descr_U); 
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+     printf("Matrix descriptor initialization U failed\n");
+     exit(1);
+  }
+
+  cusparseSolveAnalysisInfo_t info_U = 0;
+  cusparseCreateSolveAnalysisInfo(&info_U);
+  cusparseSetMatType(descr_U, CUSPARSE_MATRIX_TYPE_GENERAL);
+  cusparseSetMatFillMode(descr_U, CUSPARSE_FILL_MODE_UPPER);
+  cusparseSetMatIndexBase(descr_U, CUSPARSE_INDEX_BASE_ONE);
+  cusparseSetMatDiagType(descr_U, CUSPARSE_DIAG_TYPE_NON_UNIT);
+
+
+#if DOUBLEPRECISION
+  status = cusparseDcsrsv_analysis(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                                   descr_U, d_a, d_ia, d_ja, info_U);
+#else
+  status = cusparseScsrsv_analysis(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                                   descr_U, d_a, d_ia, d_ja, info_U);
+#endif
+
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("cusparse?csrsv_analysis L failed\n");
+    exit(1);
+  }
+ 
+  //Barrier for GPU calls
+  cudaThreadSynchronize();
+  ta = wall_timer() - t1;
+
+  t1 = wall_timer();
+  for (int j=0; j<REPEAT; j++) {
+#if DOUBLEPRECISION
+    // L-solve
+    status = cusparseDcsrsv_solve(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, &done, 
+                                  descr_L, d_a, d_ia, d_ja, info_L, d_b, d_y);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      printf("cusparse?csrsv_solve L failed\n");
+      exit(1);
+    }
+    // U-solve
+    status = cusparseDcsrsv_solve(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, &done, 
+                                  descr_U, d_a, d_ia, d_ja, info_U, d_y, d_x);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      printf("cusparse?csrsv_solve L failed\n");
+      exit(1);
+    }
+#else
+    // L-solve
+    status = cusparseScsrsv_solve(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, &done, 
+                                  descr_L, d_a, d_ia, d_ja, info_L, d_b, d_y);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      printf("cusparse?csrsv_solve L failed\n");
+      exit(1);
+    }
+    // U-solve
+    status = cusparseScsrsv_solve(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, &done, 
+                                  descr_U, d_a, d_ia, d_ja, info_U, d_y, d_x);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      printf("cusparse?csrsv_solve L failed\n");
+      exit(1);
+    }
+#endif
+  }
+
+  //Barrier for GPU calls
+  cudaThreadSynchronize();
+  t2 = wall_timer() - t1;
+
+  printf("[GPU] CUSPARSE csrsv\n");
+  printf("  time(s)=%.2f, Gflops=%.2f", t2, REPEAT*2*(nnz+n)/t2/1e9);
+  printf("  analysis time %f  ", ta);
+
+  /*-------- copy x to host mem */
+  cudaMemcpy(x, d_x, n*sizeof(REAL),
+  cudaMemcpyDeviceToHost);
+
+  cudaFree(d_ia);
+  cudaFree(d_ja);
+  cudaFree(d_a);
+  cudaFree(d_b);
+  cudaFree(d_x);
+  cudaFree(d_y);
+
+  /* destroy matrix descriptor */ 
+  status = cusparseDestroyMatDescr(descr_L); 
+  descr_L = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("Matrix descriptor destruction failed\n");
+    exit(1);
+  }
+  
+  status = cusparseDestroyMatDescr(descr_U); 
+  descr_U = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("Matrix descriptor destruction failed\n");
+    exit(1);
+  }
+
+  status = cusparseDestroySolveAnalysisInfo(info_L);
+  info_L = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("analysis info destruction failed\n");
+    exit(1);
+  }
+
+  status = cusparseDestroySolveAnalysisInfo(info_U);
+  info_U = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("analysis info destruction failed\n");
+    exit(1);
+  }
+
+  /* destroy handle */
+  status = cusparseDestroy(handle);
+  handle = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+     printf("CUSPARSE Library release of resources failed\n");
+     exit(1);
+  }
+}
+
+void luSolv_cusparse2(struct csr_t *csr, REAL *b, REAL *x) {
+  int n = csr->n;
+  int nnz = csr->nnz; 
+  int *d_ia, *d_ja;
+  REAL *d_a, *d_b, *d_x, *d_y;
+  double t1, t2, ta;
+  REAL done = 1.0;
+/*------------------- allocate Device Memory */
+  cudaMalloc((void **)&d_ia, (n+1)*sizeof(int));
+  cudaMalloc((void **)&d_ja, nnz*sizeof(int));
+  cudaMalloc((void **)&d_a, nnz*sizeof(REAL));
+  cudaMalloc((void **)&d_b, n*sizeof(REAL));
+  cudaMalloc((void **)&d_x, n*sizeof(REAL));
+  cudaMalloc((void **)&d_y, n*sizeof(REAL));
+/*------------------- Memcpy */
+  cudaMemcpy(d_ia, csr->ia, (n+1)*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ja, csr->ja, nnz*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_a, csr->a, nnz*sizeof(REAL),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_b, b, n*sizeof(REAL),
+  cudaMemcpyHostToDevice);
+    
+  cusparseStatus_t status;
+  cusparseHandle_t handle=0;
+  cusparseMatDescr_t descr_L=0, descr_U=0;
+
+  /* initialize cusparse library */
+  status= cusparseCreate(&handle);
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+     printf("CUSPARSE Library initialization failed\n");
+     exit(1);
+  }
+
+  /* create and setup matrix descriptor for L */ 
+  status= cusparseCreateMatDescr(&descr_L); 
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+     printf("Matrix descriptor initialization L failed\n");
+     exit(1);
+  }
+
+  t1 = wall_timer();
+
+  csrsv2Info_t info_L = 0;
+  cusparseCreateCsrsv2Info(&info_L);
+  cusparseSetMatType(descr_L,CUSPARSE_MATRIX_TYPE_GENERAL);
+  cusparseSetMatFillMode(descr_L, CUSPARSE_FILL_MODE_LOWER);
+  cusparseSetMatIndexBase(descr_L, CUSPARSE_INDEX_BASE_ONE);
+  cusparseSetMatDiagType(descr_L, CUSPARSE_DIAG_TYPE_NON_UNIT);
+
+  int pBufferSize_L;
+  void *pBuffer_L = 0;
+#if DOUBLEPRECISION
+  cusparseDcsrsv2_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                             descr_L, d_a, d_ia, d_ja, info_L, &pBufferSize_L);
+#else
+  cusparseScsrsv2_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                             descr_L, d_a, d_ia, d_ja, info_L, &pBufferSize_L);
+#endif
+  
+  // pBuffer returned by cudaMalloc is automatically aligned to 128 bytes.
+  cudaMalloc((void**)&pBuffer_L, pBufferSize_L);
+
+#if DOUBLEPRECISION
+  status = cusparseDcsrsv2_analysis(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                                    descr_L, d_a, d_ia, d_ja, info_L, 
+                                    CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer_L);
+#else
+  status = cusparseScsrsv2_analysis(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                                    descr_L, d_a, d_ia, d_ja, info_L,
+                                    CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer_L);
+
+#endif
+
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("cusparse?csrsv_analysis L failed\n");
+    exit(1);
+  }
+
+  /* create and setup matrix descriptor for U */ 
+  status= cusparseCreateMatDescr(&descr_U); 
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+     printf("Matrix descriptor initialization U failed\n");
+     exit(1);
+  }
+
+  csrsv2Info_t info_U = 0;
+  cusparseCreateCsrsv2Info(&info_U);
+  cusparseSetMatType(descr_U, CUSPARSE_MATRIX_TYPE_GENERAL);
+  cusparseSetMatFillMode(descr_U, CUSPARSE_FILL_MODE_UPPER);
+  cusparseSetMatIndexBase(descr_U, CUSPARSE_INDEX_BASE_ONE);
+  cusparseSetMatDiagType(descr_U, CUSPARSE_DIAG_TYPE_NON_UNIT);
+
+  int pBufferSize_U;
+  void *pBuffer_U = 0;
+#if DOUBLEPRECISION
+  cusparseDcsrsv2_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                             descr_U, d_a, d_ia, d_ja, info_U, &pBufferSize_U);
+#else
+  cusparseScsrsv2_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                             descr_U, d_a, d_ia, d_ja, info_U, &pBufferSize_U);
+#endif
+
+  // pBuffer returned by cudaMalloc is automatically aligned to 128 bytes.
+  cudaMalloc((void**)&pBuffer_U, pBufferSize_U);
+
+#if DOUBLEPRECISION
+  status = cusparseDcsrsv2_analysis(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                                    descr_U, d_a, d_ia, d_ja, info_U,
+                                    CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer_U);
+#else
+  status = cusparseScsrsv2_analysis(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, 
+                                    descr_U, d_a, d_ia, d_ja, info_U,
+                                    CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer_U);
+#endif
+
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("cusparse?csrsv_analysis U failed\n");
+    exit(1);
+  }
+ 
+  //Barrier for GPU calls
+  cudaThreadSynchronize();
+  ta = wall_timer() - t1;
+
+  t1 = wall_timer();
+  for (int j=0; j<REPEAT; j++) {
+#if DOUBLEPRECISION
+    // L-solve
+    status = cusparseDcsrsv2_solve(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, &done, 
+                                   descr_L, d_a, d_ia, d_ja, info_L, d_b, d_y,
+                                   CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer_L);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      printf("cusparse?csrsv_solve L failed\n");
+      exit(1);
+    }
+    // U-solve
+    status = cusparseDcsrsv2_solve(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, &done, 
+                                   descr_U, d_a, d_ia, d_ja, info_U, d_y, d_x,
+                                   CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer_U);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      printf("cusparse?csrsv_solve L failed\n");
+      exit(1);
+    }
+#else
+    // L-solve
+    status = cusparseScsrsv2_solve(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, &done, 
+                                   descr_L, d_a, d_ia, d_ja, info_L, d_b, d_y,
+                                   CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer_L);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      printf("cusparse?csrsv_solve L failed\n");
+      exit(1);
+    }
+    // U-solve
+    status = cusparseScsrsv2_solve(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, nnz, &done, 
+                                   descr_U, d_a, d_ia, d_ja, info_U, d_y, d_x,
+                                   CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer_U);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      printf("cusparse?csrsv_solve L failed\n");
+      exit(1);
+    }
+#endif
+  }
+
+  //Barrier for GPU calls
+  cudaThreadSynchronize();
+  t2 = wall_timer() - t1;
+
+  printf("[GPU] CUSPARSE csrsv2\n");
+  printf("  time(s)=%.2f, Gflops=%.2f", t2, REPEAT*2*(nnz+n)/t2/1e9);
+  printf("  analysis time %f  ", ta);
+
+  /*-------- copy x to host mem */
+  cudaMemcpy(x, d_x, n*sizeof(REAL),
+  cudaMemcpyDeviceToHost);
+
+  cudaFree(d_ia);
+  cudaFree(d_ja);
+  cudaFree(d_a);
+  cudaFree(d_b);
+  cudaFree(d_x);
+  cudaFree(d_y);
+  cudaFree(pBuffer_L);
+  cudaFree(pBuffer_U);
+
+  /* destroy matrix descriptor */ 
+  status = cusparseDestroyMatDescr(descr_L); 
+  descr_L = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("Matrix descriptor destruction failed\n");
+    exit(1);
+  }
+  
+  status = cusparseDestroyMatDescr(descr_U); 
+  descr_U = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("Matrix descriptor destruction failed\n");
+    exit(1);
+  }
+
+  status = cusparseDestroyCsrsv2Info(info_L);
+  info_L = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("analysis info destruction failed\n");
+    exit(1);
+  }
+
+  status = cusparseDestroyCsrsv2Info(info_U);
+  info_U = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    printf("analysis info destruction failed\n");
+    exit(1);
+  }
+
+  /* destroy handle */
+  status = cusparseDestroy(handle);
+  handle = 0;
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+     printf("CUSPARSE Library release of resources failed\n");
+     exit(1);
+  }
+}
+
+__global__
+void LU_SOL_SF1_INIT(int n, int *ia, int *da, int *dpl, int *dpu) {
+  int gid = blockIdx.x * BLOCKDIM + threadIdx.x;
+  if (gid < n) {
+    int t = da[gid];
+    dpl[gid] = t - ia[gid];
+    dpu[gid] = ia[gid+1] - t - 1;
+  }
+}
+
+#define USE_SHMEM_DPCOUNT 0
+#define USE_SHMEM_BUFFER 0
+
+__global__
+void L_SOL_SF1(int n, REAL *b, REAL *x, REAL *a, int *ja, int *ia, int *da,
+               int *jb, int *ib, int *db, int *dp, int *jlev) {
+  // num of warps in grid
+  //int nw = gridDim.x * BLOCKDIM / WARP;
+  // global warp id
+  int wid = (blockIdx.x * BLOCKDIM + threadIdx.x) / WARP;
+  // first warp in this block
+  //int fid = (blockIdx.x * BLOCKDIM) / WARP;
+  // thread lane in each warp
+  int lane = threadIdx.x & (WARP-1);
+  // shared memory for patial result in reduction
+  volatile __shared__ REAL r[BLOCKDIM + 16];
+#if USE_SHMEM_DPCOUNT || USE_SHMEM_BUFFER
+  // local warp id
+  int wlane = threadIdx.x / WARP;
+#endif
+#if USE_SHMEM_DPCOUNT
+  volatile __shared__ int dpcount[BLOCKDIM / WARP];
+#endif
+  //volatile __shared__ int spcount[BLOCKDIM / WARP];
+  volatile __shared__ int buffer[BLOCKDIM/WARP][4];
+  // make dp volatile to tell compiler do not use cached value
+  volatile int *vdp = dp;
+  
+  if (wid >= n) {
+    return;
+  }
+
+  /*
+  if (lane == 0) {
+    spcount[wlane] = 0;
+  }
+
+  __syncthreads();
+  */
+
+  // this warp works on row i
+  int i,p1,q1,p2,q2;
+#if USE_SHMEM_BUFFER
+  REAL dinv,bi,sum;
+  if (lane == 0) {
+    i = jlev[wid] - 1;
+    p1 = ia[i];
+    q1 = da[i];
+    p2 = db[i] + 1;
+    q2 = ib[i+1];
+    buffer[wlane][0] = p1;
+    buffer[wlane][1] = q1;
+    buffer[wlane][2] = p2;
+    buffer[wlane][3] = q2;
+    dinv = 1.0 / a[q1-1];
+    bi = b[i];
+  }
+  sum = 0.0;
+  p1 = buffer[wlane][0];
+  q1 = buffer[wlane][1];
+  p2 = buffer[wlane][2];
+  q2 = buffer[wlane][3];
+#else
+  i = jlev[wid] - 1;
+  p1 = ia[i];
+  q1 = da[i];
+  p2 = db[i] + 1;
+  q2 = ib[i+1];
+  REAL dinv = 1.0 / a[q1-1];
+  REAL bi = b[i];
+  REAL sum = 0.0;
+#endif
+
+  // busy waiting
+  while (1) {
+    // check dependent counts of this row
+#if USE_SHMEM_DPCOUNT
+    if (lane == 0) {
+      dpcount[wlane] = vdp[i];
+    }
+    // if it is free to go
+    //if (dpcount[wlane] == spcount[wlane]) {
+    if (dpcount[wlane] == 0) {
+      break;
+    } /*else {
+      clock_t tt = clock();
+    }*/
+#else
+    // if it is free to go
+    //if (vdp[i] == spcount[wlane]) {
+    if (vdp[i] == 0) {
+      break;
+    }
+#endif
+  }
+
+  for (int k=p1+lane; k<q1; k+=WARP) {
+    sum += a[k-1]*x[ja[k-1]-1];
+  }
+
+  // parallel reduction
+  r[threadIdx.x] = sum;
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+16];
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+8];
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+4];
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+2];
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+1];
+
+  // save the result
+  if (lane == 0) {
+    x[i] = dinv * (bi - r[threadIdx.x]);
+        
+    __threadfence();
+        
+    // reset counter
+    //dp[i] = q1 - p1;
+  }
+
+  /* remove i from other's dependents */
+  for (int k=p2+lane; k<q2; k+=WARP) {
+    int s1 = jb[k-1]-1;
+    /*
+    if (s1 < fid + BLOCKDIM / WARP && 0) {
+      int *p = (int*) &spcount[s1 - fid];
+      atomicAdd(p, 1);
+    } else {
+    */
+      int *p = dp + s1;
+      atomicSub(p, 1);
+    //}
+  }
+}
+
+__global__
+void U_SOL_SF1(int n, REAL *x, REAL *a, int *ja, int *ia, int *da,
+               int *jb, int *ib, int *db, int *dp, int *jlev) {
+  // num of warps in grid
+  //int nw = gridDim.x*BLOCKDIM/WARP;
+  // global warp id
+  int wid = (blockIdx.x * BLOCKDIM + threadIdx.x) / WARP;
+  // first warp in this block
+  //int fid = (blockIdx.x * BLOCKDIM) / WARP;
+  // thread lane in each warp
+  int lane = threadIdx.x & (WARP-1);
+  // shared memory for patial result
+  volatile __shared__ REAL r[BLOCKDIM+16];
+#if USE_SHMEM_DPCOUNT
+  // local warp id
+  int wlane = threadIdx.x / WARP;
+  volatile __shared__ int dpcount[BLOCKDIM / WARP];
+#endif
+  //volatile __shared__ int spcount[BLOCKDIM / WARP];
+  volatile int *vdp = dp;
+  
+  if (wid >= n) {
+    return;
+  }
+ 
+  /*
+  if (lane == 0) {
+    spcount[wlane] = 0;
+  }
+  
+  __syncthreads();
+  */
+
+  // this warp works on row i
+  int i = jlev[wid] - 1;
+  int p1 = da[i];
+  int q1 = ia[i+1];
+  REAL sum = 0.0;
+  REAL dinv = 1.0 / a[p1-1];
+  REAL xi = x[i];
+  int p2 = ib[i];
+  int q2 = db[i];
+
+  //wid = n - 1 - wid;
+  //fid = n - 1 - fid;
+
+  // busy waiting
+  while (1) {
+#if USE_SHMEM_DPCOUNT
+    // check dependent counts of this row
+    if (lane == 0) {
+      dpcount[wlane] = vdp[i];
+    }
+    // if it is free to go
+    if (dpcount[wlane] == 0) {
+      break;
+    } /*else {
+      clock_t tt = clock();
+    }*/
+#else
+    // if it is free to go
+    //if (vdp[i] == spcount[wlane]) {
+    if (vdp[i] == 0) {
+      break;
+    }
+#endif
+  }
+
+  for (int k=p1+1+lane; k<q1; k+=WARP) {
+    sum += a[k-1]*x[ja[k-1]-1];
+  }
+
+  // parallel reduction
+  r[threadIdx.x] = sum;
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+16];
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+8];
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+4];
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+2];
+  r[threadIdx.x] = sum = sum + r[threadIdx.x+1];
+
+  // save the result
+  if (lane == 0) {
+    x[i] = dinv * (xi - r[threadIdx.x]);
+        
+    __threadfence();
+        
+    // reset counter
+    //dp[i] = q1 - p1 - 1;
+  }
+
+  for (int k=p2+lane; k<q2; k+=WARP) {
+    int s1 = jb[k-1]-1;
+    /*
+    if (n-1-s1 < fid + BLOCKDIM / WARP && 0) {
+      int *p = (int *) &spcount[n-1-s1-fid];
+      atomicAdd(p, 1);
+    } else {
+    */
+      int *p = dp + s1;
+      atomicSub(p, 1);
+    //}
+  }
+}
+
+//--------------------------------------------------------
+void luSolvSF1(int n, int nnz, struct csr_t *csr,
+               struct syncfree_t *syncf, REAL *x, REAL *b)
+{
+  int j, *d_ia, *d_ja, *d_da, *d_ib, *d_jb, *d_db, *d_dpl,
+      *d_dpu, *d_jlevL, *d_jlevU;
+  REAL *d_a, *d_b, *d_x;
+  double t1, t2;
+
+/*------------------- allocate Device Memory */
+  cudaMalloc((void **)&d_ia, (n+1)*sizeof(int));
+  cudaMalloc((void **)&d_ja, nnz*sizeof(int));
+  cudaMalloc((void **)&d_da, n*sizeof(int));
+  cudaMalloc((void **)&d_a, nnz*sizeof(REAL));
+  cudaMalloc((void **)&d_b, n*sizeof(REAL));
+  cudaMalloc((void **)&d_x, n*sizeof(REAL));
+  cudaMalloc((void **)&d_ib, (n+1)*sizeof(int));
+  cudaMalloc((void **)&d_jb, nnz*sizeof(int));
+  cudaMalloc((void **)&d_db, n*sizeof(int));
+  cudaMalloc((void **)&d_dpl, n*sizeof(int));
+  cudaMalloc((void **)&d_dpu, n*sizeof(int));
+  cudaMalloc((void **)&d_jlevL, n*sizeof(int));
+  cudaMalloc((void **)&d_jlevU, n*sizeof(int));
+/*------------------- Memcpy */
+  cudaMemcpy(d_ia, csr->ia, (n+1)*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ja, csr->ja, nnz*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_da, csr->di, n*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_a, csr->a, nnz*sizeof(REAL),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_b, b, n*sizeof(REAL),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ib, syncf->AT.ia, (n+1)*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_jb, syncf->AT.ja, nnz*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_db, syncf->AT.di, n*sizeof(int),
+  cudaMemcpyHostToDevice);
+  //cudaMemcpy(d_dpl, syncf->dpL, n*sizeof(int),
+  //cudaMemcpyHostToDevice);
+  //cudaMemcpy(d_dpu, syncf->dpU, n*sizeof(int),
+  //cudaMemcpyHostToDevice);
+  cudaMemcpy(d_jlevL, syncf->lev.jlevL, n*sizeof(int),
+  cudaMemcpyHostToDevice);
+  cudaMemcpy(d_jlevU, syncf->lev.jlevU, n*sizeof(int),
+  cudaMemcpyHostToDevice);
+
+  int *tmp1 = (int*) malloc(n*sizeof(int));
+  int *tmp2 = (int*) malloc(n*sizeof(int));
+
+  t1 = wall_timer();
+  for (j=0; j<REPEAT; j++) {
+    int bDim = BLOCKDIM;
+    /*-------- init dependent counter of L and U */
+    int gDim0 = (n + BLOCKDIM - 1) / BLOCKDIM;
+    LU_SOL_SF1_INIT<<<gDim0, bDim>>>(n, d_ia, d_da, d_dpl, d_dpu);
+    /*-------- num of warps per block */
+    int nwb = BLOCKDIM / WARP;
+    int gDim = (n + nwb-1) / nwb;
+    // L-solve
+    L_SOL_SF1<<<gDim, bDim>>>(n, d_b, d_x, d_a, d_ja, d_ia, d_da, 
+                              d_jb, d_ib, d_db, d_dpl, d_jlevL);
+    // U-solve
+    U_SOL_SF1<<<gDim, bDim>>>(n, d_x, d_a, d_ja, d_ia, d_da, 
+                              d_jb, d_ib, d_db, d_dpu, d_jlevU);
+  }
+
+  //Barrier for GPU calls
+  cudaThreadSynchronize();
+  t2 = wall_timer() - t1;
+ 
+  //cudaMemcpy(tmp1, d_dpl, n*sizeof(int), cudaMemcpyDeviceToHost);
+  //cudaMemcpy(tmp2, d_dpu, n*sizeof(int), cudaMemcpyDeviceToHost);
+  //for (int i=0; i<n; i++) {
+    //if (tmp1[i] != syncf->dpL[i]) printf("i=%d: %d %d\n", i, tmp1[i], syncf->dpL[i]);
+    //if (tmp2[i] != syncf->dpU[i]) printf("i=%d: %d %d\n", i, tmp2[i], syncf->dpU[i]);
+    //if (tmp[i]) printf("i=%d: %d\n", i, tmp[i]);
+  //}
+
+  printf("[GPU] SyncFree v-1\n");
+  printf("  time(s)=%.2f, Gflops=%.2f", t2, REPEAT*2*(nnz+n)/t2/1e9);
+
+  /*-------- copy x to host mem */
+  cudaMemcpy(x, d_x, n*sizeof(REAL),
+  cudaMemcpyDeviceToHost);
+
+  cudaFree(d_ia);
+  cudaFree(d_ja);
+  cudaFree(d_da);
+  cudaFree(d_a);
+  cudaFree(d_b);
+  cudaFree(d_ib);
+  cudaFree(d_jb);
+  cudaFree(d_db);
+  cudaFree(d_x);
+  cudaFree(d_dpl);
+  cudaFree(d_dpu);
+}
+
